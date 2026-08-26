@@ -1,0 +1,7 @@
+* text=auto
+*.cpp text eol=crlf
+*.h text eol=crlf
+*.vcxproj text eol=crlf
+*.filters text eol=crlf
+*.slnx text eol=crlf
+*.json text eol=lf

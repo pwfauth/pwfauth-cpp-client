@@ -1,0 +1,9 @@
+.vcpkg_installed/
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+ipch/
