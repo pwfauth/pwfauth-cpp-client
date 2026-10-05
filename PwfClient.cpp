@@ -47,6 +47,61 @@ namespace
             std::to_string(GetLastError()) + ").");
     }
 
+    // No connection at all: offline, DNS, firewall, proxy or TLS.
+    void ThrowNetworkError(const char* operation)
+    {
+        throw PwfNetworkError("Cannot reach the license server: " + std::string(operation) +
+            " failed (Windows error " + std::to_string(GetLastError()) + ").");
+    }
+
+    constexpr char NetworkLostMessage[] =
+        "Cannot reach the license server. Please check your connection and sign in again.";
+    constexpr char ClockSkewMessage[] =
+        "Cannot verify your license because this computer's date and time are wrong. "
+        "Correct them and sign in again.";
+    constexpr int TooManyRequests = 429;
+    constexpr std::size_t MaxResetReason = 255;  // characters, as the server counts them
+
+    std::string JsonText(const nlohmann::json& object, const char* key)
+    {
+        if (object.is_object() && object.contains(key) && object[key].is_string())
+            return object[key].get<std::string>();
+        return {};
+    }
+
+    // The server's clock refusal: "reason": "CLOCK_SKEW", or the older plain
+    // CRYPTO_ERROR whose message says the request expired.
+    bool IsClockRefusal(const PwfResponse& reply)
+    {
+        if (JsonText(reply.data, "reason") == "CLOCK_SKEW")
+            return true;
+        std::string message = reply.Message();
+        std::transform(message.begin(), message.end(), message.begin(),
+            [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+        return reply.ErrorCode() == "CRYPTO_ERROR" && message.find("expired") != std::string::npos;
+    }
+
+    // At most `limit` characters (code points) of UTF-8 text, never cut inside one.
+    std::string TruncateUtf8(const std::string& text, std::size_t limit)
+    {
+        std::size_t characters = 0;
+        for (std::size_t index = 0; index < text.size(); ++index)
+        {
+            const bool startsCharacter = (static_cast<unsigned char>(text[index]) & 0xC0) != 0x80;
+            if (startsCharacter && ++characters > limit)
+                return text.substr(0, index);
+        }
+        return text;
+    }
+
+    std::string TrimAscii(const std::string& text)
+    {
+        const auto first = text.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos)
+            return {};
+        return text.substr(first, text.find_last_not_of(" \t\r\n") - first + 1);
+    }
+
     DWORD ToDword(std::size_t value)
     {
         if (value > std::numeric_limits<DWORD>::max())
@@ -367,6 +422,15 @@ public:
     {
     }
 
+    // This computer's clock, shifted to match the server's (0 normally).
+    std::int64_t Now() const
+    {
+        return static_cast<std::int64_t>(std::time(nullptr)) + clockOffset_.load();
+    }
+
+    std::int64_t ClockOffset() const { return clockOffset_.load(); }
+    void SetClockOffset(std::int64_t seconds) { clockOffset_ = seconds; }
+
     std::string Encrypt(const std::string& plainJson) const
     {
         ByteVector iv(16);
@@ -376,7 +440,7 @@ public:
         ByteVector combined = iv;
         combined.insert(combined.end(), cipher.begin(), cipher.end());
         const std::string payload = Base64Encode(combined);
-        const auto timestamp = static_cast<std::int64_t>(std::time(nullptr));
+        const std::int64_t timestamp = Now();
         const std::string signature = HexLower(HmacSha256(macKey_, payload + std::to_string(timestamp)));
         return nlohmann::json{
             {"p", payload},
@@ -410,8 +474,7 @@ public:
             throw std::runtime_error(
                 "HMAC verification failed - check the application secret and response integrity.");
 
-        const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
-        if (std::llabs(now - timestamp) > 300)
+        if (std::llabs(Now() - timestamp) > 300)
             throw std::runtime_error(
                 "The encrypted response timestamp is outside the accepted window; check the system clock.");
 
@@ -432,6 +495,7 @@ public:
 private:
     ByteVector encryptionKey_;
     ByteVector macKey_;
+    std::atomic<std::int64_t> clockOffset_{ 0 };
 };
 
 bool PwfResponse::Success() const
@@ -467,15 +531,21 @@ PwfClient::PwfClient(
     std::string appSecret,
     std::string baseUrl,
     int timeoutMilliseconds,
-    int maxHeartbeatFailures)
+    int maxHeartbeatFailures,
+    int maxRateLimitedBeats)
     : appSecret_(std::move(appSecret)),
       baseUrl_(std::move(baseUrl)),
       hardwareId_(ReadHardwareId()),
       timeoutMilliseconds_(timeoutMilliseconds),
-      maxHeartbeatFailures_(maxHeartbeatFailures)
+      maxHeartbeatFailures_(maxHeartbeatFailures),
+      maxRateLimitedBeats_(maxRateLimitedBeats)
 {
     if (appSecret_.empty())
         throw std::invalid_argument("The application secret is required.");
+    // Zero would leave an unreachable server (or a proxy answering 429 forever)
+    // keeping the app running.
+    if (maxHeartbeatFailures_ < 1 || maxRateLimitedBeats_ < 1)
+        throw std::invalid_argument("The heartbeat failure budgets must be at least 1.");
     while (!baseUrl_.empty() && baseUrl_.back() == '/')
         baseUrl_.pop_back();
     crypto_ = std::make_unique<CryptoEnvelope>(appSecret_);
@@ -507,7 +577,7 @@ PwfResponse PwfClient::Login(const std::string& licenseKey)
         {
             const int interval = response.data["heartbeat_interval"].get<int>();
             if (interval > 0)
-                heartbeatSeconds_ = interval;
+                heartbeatSeconds_ = (std::max)(5, interval);
         }
     }
     return response;
@@ -564,6 +634,20 @@ PwfResponse PwfClient::Logout()
     }
 }
 
+PwfResponse PwfClient::ResetHardwareId(const std::string& licenseKey, const std::string& reason)
+{
+    const std::string key = TrimAscii(licenseKey);
+    if (key.empty())
+        throw std::invalid_argument("The license key is required.");
+    std::string text = TrimAscii(reason);
+    if (text.empty())
+        text = "Reset from app";
+    return SendPlain(L"/api/customer/reset-hwid.php", {
+        {"key", key},
+        {"reason", TruncateUtf8(text, MaxResetReason)}
+    });
+}
+
 void PwfClient::StartHeartbeat()
 {
     StopHeartbeat();
@@ -585,6 +669,16 @@ void PwfClient::SetSessionEndedCallback(SessionEndedCallback callback)
 {
     std::lock_guard<std::mutex> lock(stateMutex_);
     sessionEnded_ = std::move(callback);
+}
+
+void PwfClient::SetAutoCorrectClock(bool enabled)
+{
+    autoCorrectClock_ = enabled;
+}
+
+std::int64_t PwfClient::ClockOffsetSeconds() const
+{
+    return crypto_->ClockOffset();
 }
 
 bool PwfClient::IsSignedIn() const
@@ -610,15 +704,92 @@ int PwfClient::HeartbeatSeconds() const
     return heartbeatSeconds_;
 }
 
+// POST an encrypted envelope. A plain failure (a bad app secret, a rate limit) comes
+// back as a failed reply; a plain SUCCESS throws PwfSecurityError. When the server
+// refuses this computer's clock it sends its own time: shift by the difference and
+// send the request once more.
 PwfResponse PwfClient::SendEnvelope(const std::wstring& path, const nlohmann::json& body)
 {
-    std::string raw = HttpPost(path, crypto_->Encrypt(body.dump()));
-    if (CryptoEnvelope::LooksLikeEnvelope(raw))
-        raw = crypto_->Decrypt(raw);
-    return PwfResponse::Parse(raw);
+    PwfResponse reply = SendEnvelopeOnce(path, body);
+    if (autoCorrectClock_ && TryCorrectClock(reply))
+        reply = SendEnvelopeOnce(path, body);
+    return reply;
 }
 
-std::string PwfClient::HttpPost(const std::wstring& path, const std::string& body) const
+PwfResponse PwfClient::SendEnvelopeOnce(const std::wstring& path, const nlohmann::json& body)
+{
+    const HttpReply http = HttpPost(path, crypto_->Encrypt(body.dump()));
+    if (CryptoEnvelope::LooksLikeEnvelope(http.body))
+    {
+        PwfResponse response = PwfResponse::Parse(crypto_->Decrypt(http.body));
+        response.isEnveloped = true;
+        response.statusCode = http.status;
+        return response;
+    }
+
+    PwfResponse response = ParseReply(http);
+    // Encrypted endpoints seal EVERY reply once the request is verified; only refusals
+    // before that point travel as plain JSON. A plain success therefore came from a
+    // proxy, a hosts-file redirect or a fake server, and accepting it would let any of
+    // them unlock the application.
+    if (response.Success())
+        throw PwfSecurityError("The license server's reply was not encrypted, so it cannot be trusted.");
+    return response;
+}
+
+// POST unencrypted JSON, for the endpoints that do not use the envelope.
+PwfResponse PwfClient::SendPlain(const std::wstring& path, const nlohmann::json& body)
+{
+    return ParseReply(HttpPost(path, body.dump()));
+}
+
+PwfResponse PwfClient::ParseReply(const HttpReply& http)
+{
+    if (http.body.empty())
+        throw PwfHttpError(http.status, "The license server returned HTTP " +
+            std::to_string(http.status) + " with an empty body.");
+    PwfResponse response;
+    try
+    {
+        response = PwfResponse::Parse(http.body);
+    }
+    catch (const std::runtime_error&)
+    {
+        // An HTML error page from a proxy or CDN is the usual cause.
+        throw PwfHttpError(http.status, "The license server returned a body that is not JSON (HTTP " +
+            std::to_string(http.status) + "). Check the base URL.");
+    }
+    response.statusCode = http.status;
+
+    // The API answers its own refusals with {success, error_code, message}. Anything
+    // else with a failing status is a transport problem, not an answer: a wrong app
+    // secret (HTTP 401 {"detail": ...}) or a CDN page.
+    if (http.status >= 400 && !response.data.contains("success"))
+    {
+        const std::string detail = JsonText(response.data, "detail");
+        throw PwfHttpError(http.status, "The license server returned HTTP " +
+            std::to_string(http.status) + (detail.empty() ? std::string(".") : ": " + detail));
+    }
+    return response;
+}
+
+bool PwfClient::TryCorrectClock(const PwfResponse& reply)
+{
+    // The server's plain refusal for a timestamp outside its window carries
+    // "reason": "CLOCK_SKEW" and "server_time" (unix seconds). It never sends that
+    // refusal encrypted, so only a plain reply qualifies.
+    if (reply.isEnveloped || JsonText(reply.data, "reason") != "CLOCK_SKEW")
+        return false;
+    const auto serverTime = reply.data.find("server_time");
+    if (serverTime == reply.data.end() || !serverTime->is_number_integer() ||
+        serverTime->get<std::int64_t>() <= 0)
+        return false;
+    crypto_->SetClockOffset(serverTime->get<std::int64_t>() -
+        static_cast<std::int64_t>(std::time(nullptr)));
+    return true;
+}
+
+PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::string& body) const
 {
     const std::wstring url = Utf8ToWide(baseUrl_) + path;
     URL_COMPONENTS parts{};
@@ -636,7 +807,7 @@ std::string PwfClient::HttpPost(const std::wstring& path, const std::string& bod
         requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
     InternetHandle session(WinHttpOpen(
-        L"PwfAuthCpp/1.0 (+https://pwfauth.com)",
+        L"PwfAuthCpp/1.1 (+https://pwfauth.com)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -648,7 +819,7 @@ std::string PwfClient::HttpPost(const std::wstring& path, const std::string& bod
 
     InternetHandle connection(WinHttpConnect(session, host.c_str(), parts.nPort, 0));
     if (!connection.Valid())
-        ThrowLastError("Connecting to the license server");
+        ThrowNetworkError("Connecting");
     const DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
     InternetHandle request(WinHttpOpenRequest(connection, L"POST", requestPath.c_str(),
         nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
@@ -661,33 +832,49 @@ std::string PwfClient::HttpPost(const std::wstring& path, const std::string& bod
         static_cast<void*>(const_cast<char*>(body.data()));
     if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1), requestData,
         ToDword(body.size()), ToDword(body.size()), 0))
-        ThrowLastError("Sending the license request");
+        ThrowNetworkError("Sending the request");
     if (!WinHttpReceiveResponse(request, nullptr))
-        ThrowLastError("Receiving the license response");
+        ThrowNetworkError("Receiving the reply");
 
-    std::string response;
+    HttpReply reply;
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX))
+        reply.status = static_cast<int>(status);
+
+    // A 4xx still carries the API's JSON refusal worth reading.
     while (true)
     {
         DWORD available = 0;
         if (!WinHttpQueryDataAvailable(request, &available))
-            ThrowLastError("Reading the license response");
+            ThrowNetworkError("Reading the reply");
         if (available == 0)
             break;
-        const std::size_t offset = response.size();
-        response.resize(offset + available);
+        const std::size_t offset = reply.body.size();
+        reply.body.resize(offset + available);
         DWORD read = 0;
-        if (!WinHttpReadData(request, response.data() + offset, available, &read))
-            ThrowLastError("Reading the license response");
-        response.resize(offset + read);
+        if (!WinHttpReadData(request, reply.body.data() + offset, available, &read))
+            ThrowNetworkError("Reading the reply");
+        reply.body.resize(offset + read);
     }
-    if (response.empty())
-        throw std::runtime_error("The license server returned an empty response.");
-    return response;
+    return reply;
 }
 
 void PwfClient::HeartbeatLoop()
 {
-    int failures = 0;
+    // Only an encrypted reply proves the license server answered: nothing else can seal
+    // one. Every other outcome is an unanswered beat: no reply, a reply that fails
+    // verification, a forged plain "success" (PwfSecurityError), and plain refusals,
+    // which the server sends when it cannot verify the request at all. The commonest of
+    // those is its replay check rejecting a clock more than five minutes off. Treating
+    // any parsed reply as an answer (as 1.0 did) let an app whose clock was moved run
+    // forever, deaf to bans.
+    int unanswered = 0;     // beats in a row without an encrypted reply (not 429)
+    int plainRefusals = 0;  //   ...of which were plain refusals from the server
+    int clockRefusals = 0;  //   ...of which blamed this computer's clock
+    int rateLimited = 0;    // beats in a row answered with HTTP 429
+
     while (!stopHeartbeat_)
     {
         int interval = 60;
@@ -701,25 +888,66 @@ void PwfClient::HeartbeatLoop()
             return;
         waitLock.unlock();
 
+        PwfResponse response;
+        bool replied = false;
+        int failedStatus = 0;
         try
         {
-            PwfResponse response = Heartbeat();
-            failures = 0;
-            if (!response.Success() && EndsSession(response.ErrorCode()))
-            {
-                EndSession(response.ErrorCode(), response.Message());
-                return;
-            }
+            response = Heartbeat();
+            replied = true;
+        }
+        catch (const PwfHttpError& error)
+        {
+            failedStatus = error.Status();
         }
         catch (const std::exception&)
         {
-            ++failures;
-            if (failures >= maxHeartbeatFailures_)
+        }
+        // Signed out (or stopped) while the beat was in flight: say nothing.
+        if (stopHeartbeat_)
+            return;
+
+        if (!replied || !response.isEnveloped)
+        {
+            // Shared IPs get rate limited legitimately, so 429 has its own, larger budget.
+            if ((replied ? response.statusCode : failedStatus) == TooManyRequests)
             {
-                EndSession("NETWORK_LOST", "The license server is unreachable.");
+                if (++rateLimited >= maxRateLimitedBeats_)
+                {
+                    EndSession("NETWORK_LOST", NetworkLostMessage);
+                    return;
+                }
+                continue;
+            }
+            if (replied)
+            {
+                ++plainRefusals;
+                if (IsClockRefusal(response))
+                    ++clockRefusals;
+            }
+            if (++unanswered >= maxHeartbeatFailures_)
+            {
+                // When every plain refusal blamed the clock, say so: signing in again
+                // cannot work until it is corrected.
+                if (plainRefusals > 0 && clockRefusals == plainRefusals)
+                    EndSession("CLOCK_SKEW", ClockSkewMessage);
+                else
+                    EndSession("NETWORK_LOST", NetworkLostMessage);
                 return;
             }
+            continue;
         }
+
+        // Encrypted: the server is reachable and the clock is fine. Every count starts
+        // over, and neither kind of failure resets the other, so alternating them cannot
+        // keep the loop alive either.
+        unanswered = plainRefusals = clockRefusals = rateLimited = 0;
+        if (!response.Success() && EndsSession(response.ErrorCode()))
+        {
+            EndSession(response.ErrorCode(), response.Message());
+            return;
+        }
+        // An unknown encrypted failure: transient, keep beating.
     }
 }
 

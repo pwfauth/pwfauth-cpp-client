@@ -9,6 +9,7 @@
 #define IDC_DETAILS           1007
 #define IDC_JSON              1008
 #define IDC_COPY_JSON         1009
+#define IDC_MOVE_LICENSE      1010
 
 #define WM_PWF_LOGIN_COMPLETE (WM_APP + 1)
 #define WM_PWF_LOGOUT_COMPLETE (WM_APP + 2)
