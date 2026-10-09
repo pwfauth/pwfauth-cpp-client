@@ -33,10 +33,8 @@ private:
     int status_;
 };
 
-// An encrypted endpoint answered with an UNENCRYPTED "success". The license server
-// encrypts every reply of these endpoints once it has accepted the app secret; only
-// refusals travel as plain JSON. A plain success therefore came from a proxy, a
-// hosts-file redirect or a fake server. Never unlock the application on it.
+// A reply failed independent server-signature or encrypted-envelope verification.
+// Never unlock the application on an untrusted reply.
 class PwfSecurityError : public std::runtime_error
 {
 public:

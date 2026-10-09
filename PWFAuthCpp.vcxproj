@@ -99,6 +99,8 @@
   <ItemGroup>
     <ClInclude Include="PwfClient.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="ProductionPolicy.h" />
+    <ClInclude Include="ServerPublicKey.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" />

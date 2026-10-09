@@ -1,4 +1,5 @@
 #include "PwfClient.h"
+#include "ProductionPolicy.h"
 #include "resource.h"
 
 #include <windows.h>
@@ -104,28 +105,9 @@ namespace
         return first < last ? std::wstring(first, last) : std::wstring{};
     }
 
-    std::string EnvironmentValue(const wchar_t* name)
-    {
-        wchar_t buffer[512]{};
-        const DWORD length = GetEnvironmentVariableW(name, buffer, static_cast<DWORD>(std::size(buffer)));
-        if (length == 0 || length >= std::size(buffer))
-            return {};
-        return WideToUtf8(Trim(std::wstring(buffer, length)));
-    }
-
-    // The PWFAUTH_SECRET environment variable overrides the in-code demo secret.
-    std::string AppSecret()
-    {
-        const std::string fromEnvironment = EnvironmentValue(L"PWFAUTH_SECRET");
-        return fromEnvironment.empty() ? std::string(APP_SECRET) : fromEnvironment;
-    }
-
-    // Optional: another server, e.g. a staging copy. Empty = https://pwfauth.com.
-    std::string BaseUrl()
-    {
-        const std::string fromEnvironment = EnvironmentValue(L"PWFAUTH_BASE_URL");
-        return fromEnvironment.empty() ? std::string("https://pwfauth.com") : fromEnvironment;
-    }
+    // Production configuration is fixed at build time, never taken from the environment.
+    std::string AppSecret() { return std::string(APP_SECRET); }
+    std::string BaseUrl() { return pwf_policy::Origin; }
 
     bool HasConfiguredSecret()
     {
@@ -684,7 +666,7 @@ namespace
             if (!HasConfiguredSecret())
             {
                 SetLoginMessage(
-                    L"Replace APP_SECRET near the top of main.cpp (or set PWFAUTH_SECRET) with your "
+                    L"Replace APP_SECRET near the top of main.cpp with your "
                     L"64-character hex secret.",
                     true);
                 return;
@@ -731,8 +713,7 @@ namespace
                 }
                 catch (const PwfSecurityError&)
                 {
-                    result->error = L"The reply claimed success without encryption, so it did not come "
-                        L"from the license server. A proxy, a hosts-file entry or a fake server is in the way.";
+                    result->error = L"The server reply could not be verified. Sign-in was refused.";
                 }
                 catch (const PwfNetworkError&)
                 {
@@ -743,7 +724,7 @@ namespace
                 {
                     if (exception.Status() == 401)
                         result->error = L"The license server refused the application secret (HTTP 401). "
-                            L"Check APP_SECRET in main.cpp or PWFAUTH_SECRET.";
+                            L"Check APP_SECRET in main.cpp.";
                     else
                         result->error = L"The license server did not return a valid response (HTTP " +
                             std::to_wstring(exception.Status()) + L").";

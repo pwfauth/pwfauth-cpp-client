@@ -1,4 +1,6 @@
 #include "PwfClient.h"
+#include "ProductionPolicy.h"
+#include "ServerPublicKey.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -413,6 +415,29 @@ namespace
     }
 }
 
+namespace {
+bool VerifyServerSignature(const std::string& material, const std::string& encodedSignature)
+{
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    bool valid = false;
+    try {
+        ByteVector blob = Base64Decode(PwfServerPublicKey);
+        ByteVector signature = Base64Decode(encodedSignature);
+        ByteVector digest = Sha256(material);
+        CheckNt(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_RSA_ALGORITHM, nullptr, 0), "Opening RSA");
+        CheckNt(BCryptImportKeyPair(algorithm, nullptr, BCRYPT_RSAPUBLIC_BLOB, &key,
+            blob.data(), ToDword(blob.size()), 0), "Importing server public key");
+        BCRYPT_PKCS1_PADDING_INFO padding{ BCRYPT_SHA256_ALGORITHM };
+        valid = BCryptVerifySignature(key, &padding, digest.data(), ToDword(digest.size()),
+            signature.data(), ToDword(signature.size()), BCRYPT_PAD_PKCS1) >= 0;
+    } catch (...) { valid = false; }
+    if (key) BCryptDestroyKey(key);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    return valid;
+}
+}
+
 class PwfClient::CryptoEnvelope
 {
 public:
@@ -540,6 +565,7 @@ PwfClient::PwfClient(
       maxHeartbeatFailures_(maxHeartbeatFailures),
       maxRateLimitedBeats_(maxRateLimitedBeats)
 {
+    pwf_policy::ValidateOrigin(baseUrl_);
     if (appSecret_.empty())
         throw std::invalid_argument("The application secret is required.");
     // Zero would leave an unreachable server (or a proxy answering 429 forever)
@@ -791,6 +817,11 @@ bool PwfClient::TryCorrectClock(const PwfResponse& reply)
 
 PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::string& body) const
 {
+    pwf_policy::ValidateOrigin(baseUrl_);
+    ByteVector nonceBytes(32);
+    CheckNt(BCryptGenRandom(nullptr, nonceBytes.data(), ToDword(nonceBytes.size()),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG), "Generating response nonce");
+    const std::string nonce = HexLower(nonceBytes);
     const std::wstring url = Utf8ToWide(baseUrl_) + path;
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
@@ -826,8 +857,13 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
     if (!request.Valid())
         ThrowLastError("Creating the HTTP request");
 
+    // Refuse redirects before any secret can be forwarded to another origin.
+    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+        &redirectPolicy, sizeof(redirectPolicy)))
+        ThrowLastError("Disabling redirects");
     const std::wstring headers = L"Content-Type: application/json\r\nX-App-Secret: " +
-        Utf8ToWide(appSecret_) + L"\r\n";
+        Utf8ToWide(appSecret_) + L"\r\nX-PWF-Nonce: " + Utf8ToWide(nonce) + L"\r\n";
     void* requestData = body.empty() ? WINHTTP_NO_REQUEST_DATA :
         static_cast<void*>(const_cast<char*>(body.data()));
     if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1), requestData,
@@ -851,6 +887,8 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
             ThrowNetworkError("Reading the reply");
         if (available == 0)
             break;
+        if (available > 4 * 1024 * 1024 || reply.body.size() > 4 * 1024 * 1024 - available)
+            throw PwfSecurityError("Server response exceeds the size limit.");
         const std::size_t offset = reply.body.size();
         reply.body.resize(offset + available);
         DWORD read = 0;
@@ -858,6 +896,16 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
             ThrowNetworkError("Reading the reply");
         reply.body.resize(offset + read);
     }
+    wchar_t signatureBuffer[2048]{};
+    DWORD signatureBytes = sizeof(signatureBuffer);
+    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"X-PWF-Signature",
+        signatureBuffer, &signatureBytes, WINHTTP_NO_HEADER_INDEX))
+        throw PwfSecurityError("Missing server signature.");
+    const std::string material = "PWF-REPLY-V1\n" + nonce + "\nPOST\n" + WideToUtf8(path) +
+        "\n" + HexLower(Sha256(body)) + "\n" + std::to_string(reply.status) +
+        "\n" + HexLower(Sha256(reply.body));
+    if (!VerifyServerSignature(material, WideToUtf8(signatureBuffer)))
+        throw PwfSecurityError("Invalid server signature or mismatched request.");
     return reply;
 }
 
