@@ -84,6 +84,11 @@ bin\Debug\PWFAuthCpp.exe
 The application runs an offline AES/HMAC round-trip self-test before showing the
 sign-in window. A real login still requires the application secret and a valid key.
 
+## New server key — 2026-10-11 (1.2)
+
+PWF Auth signs its replies with a new key. Copy the new `ServerPublicKey.h` (and `PwfClient.cpp`) into your
+project and rebuild: a build with the old key refuses every reply from the current server.
+
 ## Security update — 2026-10-09
 
 Rebuild and redistribute applications that embed an older version of this sample.

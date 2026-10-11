@@ -838,7 +838,7 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
         requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
     InternetHandle session(WinHttpOpen(
-        L"PwfAuthCpp/1.1 (+https://pwfauth.com)",
+        L"PwfAuthCpp/1.2 (+https://pwfauth.com)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
