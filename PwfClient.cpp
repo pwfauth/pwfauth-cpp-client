@@ -674,6 +674,118 @@ PwfResponse PwfClient::ResetHardwareId(const std::string& licenseKey, const std:
     });
 }
 
+// ── Customer accounts ──
+// These endpoints speak plain JSON (no envelope); every reply is still checked against
+// the server's signature in HttpPost, like all others.
+
+PwfResponse PwfClient::RegisterAccount(const std::string& username, const std::string& password,
+    const std::string& email)
+{
+    if (TrimAscii(username).empty())
+        throw std::invalid_argument("The username is required.");
+    if (password.empty())
+        throw std::invalid_argument("The password is required.");
+    return SendPlain(L"/api/auth/account-register.php", {
+        {"username", TrimAscii(username)},
+        {"password", password},
+        {"email", TrimAscii(email)}
+    });
+}
+
+PwfResponse PwfClient::RegisterAccountWithKey(const std::string& username, const std::string& password,
+    const std::string& licenseKey, const std::string& email)
+{
+    if (TrimAscii(username).empty())
+        throw std::invalid_argument("The username is required.");
+    if (password.empty())
+        throw std::invalid_argument("The password is required.");
+    if (TrimAscii(licenseKey).empty())
+        throw std::invalid_argument("The license key is required.");
+    return SendPlain(L"/api/auth/account-register.php", {
+        {"username", TrimAscii(username)},
+        {"password", password},
+        {"email", TrimAscii(email)},
+        {"license_key", TrimAscii(licenseKey)}
+    });
+}
+
+PwfResponse PwfClient::AccountLogin(const std::string& username, const std::string& password)
+{
+    if (TrimAscii(username).empty())
+        throw std::invalid_argument("The username is required.");
+    PwfResponse response = SendPlain(L"/api/auth/account-login.php", {
+        {"username", TrimAscii(username)},
+        {"password", password},
+        {"hwid", hardwareId_}
+    });
+    if (response.Success())
+    {
+        const std::string session = response.data.value("session_id", std::string{});
+        if (session.empty())
+            throw std::runtime_error("The account login reply did not contain a session ID.");
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        sessionId_ = session;
+        // An account session is "user:<id>" on the server, not a key: no key from an
+        // earlier Login may ride along, or the heartbeat is refused (SESSION_MISMATCH).
+        licenseKey_ = JsonText(response.data, "license_key");
+        if (response.data.contains("heartbeat_interval") &&
+            response.data["heartbeat_interval"].is_number_integer())
+        {
+            const int interval = response.data["heartbeat_interval"].get<int>();
+            if (interval > 0)
+                heartbeatSeconds_ = (std::max)(5, interval);
+        }
+    }
+    return response;
+}
+
+PwfResponse PwfClient::ChangeAccountPassword(const std::string& username, const std::string& currentPassword,
+    const std::string& newPassword)
+{
+    if (TrimAscii(username).empty())
+        throw std::invalid_argument("The username is required.");
+    if (newPassword.empty())
+        throw std::invalid_argument("The new password is required.");
+    return SendPlain(L"/api/auth/change-password.php", {
+        {"username", TrimAscii(username)},
+        {"current_password", currentPassword},
+        {"new_password", newPassword}
+    });
+}
+
+PwfResponse PwfClient::RedeemKey(const std::string& username, const std::string& password,
+    const std::string& licenseKey)
+{
+    if (TrimAscii(username).empty())
+        throw std::invalid_argument("The username is required.");
+    if (password.empty())
+        throw std::invalid_argument("The password is required.");
+    if (TrimAscii(licenseKey).empty())
+        throw std::invalid_argument("The license key is required.");
+    return SendPlain(L"/api/auth/account-redeem.php", {
+        {"username", TrimAscii(username)},
+        {"password", password},
+        {"license_key", TrimAscii(licenseKey)}
+    });
+}
+
+PwfResponse PwfClient::RedeemKey(const std::string& licenseKey)
+{
+    if (TrimAscii(licenseKey).empty())
+        throw std::invalid_argument("The license key is required.");
+    std::string session;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        session = sessionId_;
+    }
+    if (session.empty())
+        throw std::runtime_error("No account is signed in; call AccountLogin first, or pass the username and password.");
+    return SendPlain(L"/api/auth/account-redeem.php", {
+        {"session_id", session},
+        {"license_key", TrimAscii(licenseKey)}
+    });
+}
+
 void PwfClient::StartHeartbeat()
 {
     StopHeartbeat();
@@ -838,7 +950,7 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
         requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
     InternetHandle session(WinHttpOpen(
-        L"PwfAuthCpp/1.2 (+https://pwfauth.com)",
+        L"PwfAuthCpp/1.3 (+https://pwfauth.com)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,

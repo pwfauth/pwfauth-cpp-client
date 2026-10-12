@@ -84,6 +84,42 @@ bin\Debug\PWFAuthCpp.exe
 The application runs an offline AES/HMAC round-trip self-test before showing the
 sign-in window. A real login still requires the application secret and a valid key.
 
+## Customer accounts - 2026-10-12 (1.3)
+
+Besides licence keys, your customers can have an account with a username and a password
+(turn customer accounts on for the app in the panel). `PwfClient` now has:
+
+| Function | What it does |
+|---|---|
+| `RegisterAccount(username, password, email)` | Creates an account |
+| `RegisterAccountWithKey(username, password, key, email)` | Creates an account that takes a key's time (the key is used up) |
+| `AccountLogin(username, password)` | Signs the account in on this PC; start the heartbeat afterwards, like after `Login` |
+| `ChangeAccountPassword(username, current, new)` | Changes the password (every session of the account is signed out) |
+| `RedeemKey(username, password, key)` / `RedeemKey(key)` | Adds a key's time to an account (the second one uses the signed-in session) |
+
+```cpp
+PwfClient client(appSecret);
+
+PwfResponse made = client.RegisterAccount("alice", "a-strong-password", "alice@example.com");
+if (!made.Success() && made.ErrorCode() != "USERNAME_EXISTS")
+    return ShowError(made.Message());          // written for the customer
+
+PwfResponse login = client.AccountLogin("alice", "a-strong-password");
+if (!login.Success())
+    return ShowError(login.Message());         // INVALID_CREDENTIALS, BANNED, EXPIRED, ...
+
+client.SetSessionEndedCallback([](const std::string& code, const std::string& message) {
+    // banned, paused, expired, signed out from the panel: close your app here
+});
+client.StartHeartbeat();
+
+// later: a key bought from a reseller adds its time to the account
+PwfResponse added = client.RedeemKey("XXXXX-XXXXX-XXXXX-XXXXX");
+```
+
+Copy the new `PwfClient.h` and `PwfClient.cpp` into your project; `ServerPublicKey.h` and
+`ProductionPolicy.h` are unchanged from 1.2.
+
 ## New server key — 2026-10-11 (1.2)
 
 PWF Auth signs its replies with a new key. Copy the new `ServerPublicKey.h` (and `PwfClient.cpp`) into your

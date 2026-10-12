@@ -83,6 +83,35 @@ public:
     // RATE_LIMITED or SELF_RESET_DISABLED.
     PwfResponse ResetHardwareId(const std::string& licenseKey, const std::string& reason = "");
 
+    // ── Customer accounts (username + password instead of a key) ──
+    // Only while the developer has customer accounts switched on for the app.
+
+    // Creates an account. When the app's sign-up needs a licence key, use
+    // RegisterAccountWithKey instead (this one is then refused with KEY_REQUIRED).
+    // Refusals: USERNAME_EXISTS, KEY_REQUIRED, REGISTRATION_DISABLED, INVALID_INPUT.
+    PwfResponse RegisterAccount(const std::string& username, const std::string& password,
+        const std::string& email = "");
+    // Creates an account that takes a licence key's time and device limit; the key is
+    // used up (Login with it then answers KEY_REDEEMED). Refusals: INVALID_KEY,
+    // KEY_ALREADY_USED, KEY_IN_USE, BANNED, PAUSED, EXPIRED, USERNAME_EXISTS.
+    PwfResponse RegisterAccountWithKey(const std::string& username, const std::string& password,
+        const std::string& licenseKey, const std::string& email = "");
+    // Signs an account in and opens a session bound to this PC, exactly like Login:
+    // call StartHeartbeat afterwards, the kill switch works the same way.
+    // Refusals: INVALID_CREDENTIALS, BANNED, PAUSED, EXPIRED, HWID_MISMATCH, MAINTENANCE.
+    PwfResponse AccountLogin(const std::string& username, const std::string& password);
+    // Changes an account's password; every session of the account is signed out.
+    PwfResponse ChangeAccountPassword(const std::string& username, const std::string& currentPassword,
+        const std::string& newPassword);
+    // Adds a licence key's time to an account and uses the key up (works while the
+    // account has expired too). The reply has days_added, expires_at, days_remaining.
+    // Refusals: INVALID_CREDENTIALS, INVALID_KEY, KEY_ALREADY_USED, KEY_IN_USE,
+    // BANNED, PAUSED, ALREADY_LIFETIME.
+    PwfResponse RedeemKey(const std::string& username, const std::string& password,
+        const std::string& licenseKey);
+    // The same for the account signed in with AccountLogin, through its session (no password).
+    PwfResponse RedeemKey(const std::string& licenseKey);
+
     // Keeps the session alive AND obeys the kill switch. Only an encrypted reply counts
     // as an answer: maxHeartbeatFailures beats in a row without one (no reply, a plain
     // refusal, a forged plain success) end the session with NETWORK_LOST, or with
