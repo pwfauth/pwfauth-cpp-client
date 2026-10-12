@@ -31,6 +31,11 @@ namespace
         InternetHandle& operator=(const InternetHandle&) = delete;
         operator HINTERNET() const { return handle_; }
         bool Valid() const { return handle_ != nullptr; }
+        void Reset(HINTERNET handle)
+        {
+            if (handle_) WinHttpCloseHandle(handle_);
+            handle_ = handle;
+        }
 
     private:
         HINTERNET handle_;
@@ -62,6 +67,7 @@ namespace
         "Cannot verify your license because this computer's date and time are wrong. "
         "Correct them and sign in again.";
     constexpr int TooManyRequests = 429;
+    constexpr DWORD RetryDelayMilliseconds = 300;  // before the second try of a request with no reply
     constexpr std::size_t MaxResetReason = 255;  // characters, as the server counts them
 
     std::string JsonText(const nlohmann::json& object, const char* key)
@@ -950,7 +956,7 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
         requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
     InternetHandle session(WinHttpOpen(
-        L"PwfAuthCpp/1.3 (+https://pwfauth.com)",
+        L"PwfAuthCpp/1.3.1 (+https://pwfauth.com)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -964,25 +970,45 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
     if (!connection.Valid())
         ThrowNetworkError("Connecting");
     const DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-    InternetHandle request(WinHttpOpenRequest(connection, L"POST", requestPath.c_str(),
-        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
-    if (!request.Valid())
-        ThrowLastError("Creating the HTTP request");
-
-    // Refuse redirects before any secret can be forwarded to another origin.
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-    if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
-        &redirectPolicy, sizeof(redirectPolicy)))
-        ThrowLastError("Disabling redirects");
     const std::wstring headers = L"Content-Type: application/json\r\nX-App-Secret: " +
         Utf8ToWide(appSecret_) + L"\r\nX-PWF-Nonce: " + Utf8ToWide(nonce) + L"\r\n";
     void* requestData = body.empty() ? WINHTTP_NO_REQUEST_DATA :
         static_cast<void*>(const_cast<char*>(body.data()));
-    if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1), requestData,
-        ToDword(body.size()), ToDword(body.size()), 0))
-        ThrowNetworkError("Sending the request");
-    if (!WinHttpReceiveResponse(request, nullptr))
-        ThrowNetworkError("Receiving the reply");
+
+    // 1.3.1: when no reply arrives at all, the same request goes out once more on a new
+    // connection. The usual cause is a connection closed on the way (Windows error 10054,
+    // "connection reset"), and the second try goes through. A reply, even an error reply,
+    // is never sent twice, and neither is a timeout.
+    InternetHandle request;
+    for (int attempt = 1; ; ++attempt)
+    {
+        request.Reset(WinHttpOpenRequest(connection, L"POST", requestPath.c_str(),
+            nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags));
+        if (!request.Valid())
+            ThrowLastError("Creating the HTTP request");
+
+        // Refuse redirects before any secret can be forwarded to another origin.
+        DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+        if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+            &redirectPolicy, sizeof(redirectPolicy)))
+            ThrowLastError("Disabling redirects");
+
+        const char* failed = nullptr;
+        if (!WinHttpSendRequest(request, headers.c_str(), static_cast<DWORD>(-1), requestData,
+            ToDword(body.size()), ToDword(body.size()), 0))
+            failed = "Sending the request";
+        else if (!WinHttpReceiveResponse(request, nullptr))
+            failed = "Receiving the reply";
+        if (!failed)
+            break;
+        const DWORD error = GetLastError();
+        if (attempt == 2 || error == ERROR_WINHTTP_TIMEOUT)
+        {
+            SetLastError(error);
+            ThrowNetworkError(failed);
+        }
+        Sleep(RetryDelayMilliseconds);
+    }
 
     HttpReply reply;
     DWORD status = 0;

@@ -84,6 +84,15 @@ bin\Debug\PWFAuthCpp.exe
 The application runs an offline AES/HMAC round-trip self-test before showing the
 sign-in window. A real login still requires the application secret and a valid key.
 
+## Dropped connections - 2026-10-12 (1.3.1)
+
+When a request gets no reply at all, usually a connection closed on the way (Windows error
+10054 or WinHTTP error 12030), `PwfClient` now sends the same request once more on a new
+connection, 300 ms later. Before, such a call failed with `PwfNetworkError`
+"Cannot reach the license server". Only that case is retried: a reply (even an error reply),
+a reply that drops while it is read, and a timeout are never sent twice. Nothing else
+changed: same signing key, same functions.
+
 ## Customer accounts - 2026-10-12 (1.3)
 
 Besides licence keys, your customers can have an account with a username and a password
