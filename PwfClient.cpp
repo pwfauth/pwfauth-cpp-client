@@ -933,14 +933,47 @@ bool PwfClient::TryCorrectClock(const PwfResponse& reply)
     return true;
 }
 
+// 1.4: pwfauth.com first; when it gives no reply at all, the same request goes to the backup name
+// pwfauth.net (same server, same signing key). Used only when the request certainly never reached
+// a server (the name does not resolve, no connection, TLS refused), or on a timeout before this client
+// ever got a reply. Once the backup answers, this client stays on it. A reply, even an error reply,
+// is never sent to the other name.
 PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::string& body) const
 {
     pwf_policy::ValidateOrigin(baseUrl_);
+    const int first = activeOrigin_.load();
+    for (int i = first; ; ++i)
+    {
+        unsigned long sendError = 0;
+        try
+        {
+            HttpReply reply = HttpPostTo(pwf_policy::Origins[i], path, body, sendError);
+            if (i != first)
+                activeOrigin_.store(i);
+            answered_.store(true);
+            return reply;
+        }
+        catch (const PwfNetworkError&)
+        {
+            const bool neverSent = sendError == ERROR_WINHTTP_NAME_NOT_RESOLVED ||
+                sendError == ERROR_WINHTTP_CANNOT_CONNECT ||
+                sendError == ERROR_WINHTTP_SECURE_FAILURE ||
+                sendError == ERROR_WINHTTP_CONNECTION_ERROR;
+            const bool silent = sendError == ERROR_WINHTTP_TIMEOUT && !answered_.load();
+            if (i + 1 >= pwf_policy::OriginCount || !(neverSent || silent))
+                throw;
+        }
+    }
+}
+
+PwfClient::HttpReply PwfClient::HttpPostTo(const std::string& origin, const std::wstring& path,
+    const std::string& body, unsigned long& sendError) const
+{
     ByteVector nonceBytes(32);
     CheckNt(BCryptGenRandom(nullptr, nonceBytes.data(), ToDword(nonceBytes.size()),
         BCRYPT_USE_SYSTEM_PREFERRED_RNG), "Generating response nonce");
     const std::string nonce = HexLower(nonceBytes);
-    const std::wstring url = Utf8ToWide(baseUrl_) + path;
+    const std::wstring url = Utf8ToWide(origin) + path;
     URL_COMPONENTS parts{};
     parts.dwStructSize = sizeof(parts);
     parts.dwSchemeLength = static_cast<DWORD>(-1);
@@ -956,7 +989,7 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
         requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
     InternetHandle session(WinHttpOpen(
-        L"PwfAuthCpp/1.3.1 (+https://pwfauth.com)",
+        L"PwfAuthCpp/1.4 (+https://pwfauth.com)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -968,7 +1001,10 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
 
     InternetHandle connection(WinHttpConnect(session, host.c_str(), parts.nPort, 0));
     if (!connection.Valid())
+    {
+        sendError = GetLastError();
         ThrowNetworkError("Connecting");
+    }
     const DWORD flags = parts.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
     const std::wstring headers = L"Content-Type: application/json\r\nX-App-Secret: " +
         Utf8ToWide(appSecret_) + L"\r\nX-PWF-Nonce: " + Utf8ToWide(nonce) + L"\r\n";
@@ -1004,6 +1040,7 @@ PwfClient::HttpReply PwfClient::HttpPost(const std::wstring& path, const std::st
         const DWORD error = GetLastError();
         if (attempt == 2 || error == ERROR_WINHTTP_TIMEOUT)
         {
+            sendError = error;
             SetLastError(error);
             ThrowNetworkError(failed);
         }

@@ -84,6 +84,23 @@ bin\Debug\PWFAuthCpp.exe
 The application runs an offline AES/HMAC round-trip self-test before showing the
 sign-in window. A real login still requires the application secret and a valid key.
 
+## Blocked networks - 2026-10-13 (1.4)
+
+Some networks block the name `pwfauth.com` (Etisalat in the UAE answers "no such domain"),
+so the app could not reach the license server without a VPN. `PwfClient` now tries the same
+server under a second name, `https://pwfauth.net`, when `pwfauth.com` gives no reply at all:
+
+- only when the request certainly never reached a server (the name does not resolve, no
+  connection, the secure connection is refused), or on a timeout before this client ever
+  got a reply;
+- a reply, even an error reply, is never sent to the other name;
+- once `pwfauth.net` answers, the client stays on it until it is closed;
+- both names are fixed in `ProductionPolicy.h`; the server, the signing key and every reply
+  check are the same.
+
+Copy the new `PwfClient.cpp`, `PwfClient.h` and `ProductionPolicy.h` into your app and
+rebuild. Nothing else changes.
+
 ## Dropped connections - 2026-10-12 (1.3.1)
 
 When a request gets no reply at all, usually a connection closed on the way (Windows error
@@ -129,12 +146,12 @@ PwfResponse added = client.RedeemKey("XXXXX-XXXXX-XXXXX-XXXXX");
 Copy the new `PwfClient.h` and `PwfClient.cpp` into your project; `ServerPublicKey.h` and
 `ProductionPolicy.h` are unchanged from 1.2.
 
-## New server key — 2026-10-11 (1.2)
+## New server key ï¿½ 2026-10-11 (1.2)
 
 PWF Auth signs its replies with a new key. Copy the new `ServerPublicKey.h` (and `PwfClient.cpp`) into your
 project and rebuild: a build with the old key refuses every reply from the current server.
 
-## Security update — 2026-10-09
+## Security update ï¿½ 2026-10-09
 
 Rebuild and redistribute applications that embed an older version of this sample.
 Existing EXEs do not gain this protection automatically. PWFAUTH_BASE_URL and

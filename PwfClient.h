@@ -146,11 +146,15 @@ private:
     bool TryCorrectClock(const PwfResponse& reply);
     static PwfResponse ParseReply(const HttpReply& http);
     HttpReply HttpPost(const std::wstring& path, const std::string& body) const;
+    HttpReply HttpPostTo(const std::string& origin, const std::wstring& path, const std::string& body,
+        unsigned long& sendError) const;
     void HeartbeatLoop();
     void EndSession(const std::string& code, const std::string& message);
 
     std::string appSecret_;
     std::string baseUrl_;
+    mutable std::atomic<int> activeOrigin_{ 0 };   // index in pwf_policy::Origins that answers here
+    mutable std::atomic<bool> answered_{ false };  // some reply has arrived in this client
     std::string hardwareId_;
     int timeoutMilliseconds_;
     int maxHeartbeatFailures_;
