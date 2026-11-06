@@ -60,6 +60,41 @@ bin\Debug\PWFAuthCpp.exe
 
 应用在显示登录窗口之前，会先离线运行一次 AES/HMAC 往返自检。真正登录仍需要应用密钥和有效的许可证密钥
 
+## 受保护的文件：2026-11-07（1.5）
+
+受保护的文件是你的程序需要、保存在 PWF Auth 服务器上、只提供给已登录程序的文件（在后台添加：App settings → Files）。DLL 里的检查可以被修补掉，但留在服务器上的部分去不掉：把 DLL 离不开的内容放进受保护的文件，跳过登录的副本就没有东西可运行。`PwfClient` 新增了以下函数：
+
+| 函数 | 作用 |
+|---|---|
+| `GetResource(name)` | 在 `Login` 或 `AccountLogin` 之后获取文件。`bytes` 就是文件内容，已用服务器发来的 SHA-256 校验 |
+| `ListResources()` | `names` 是该客户可以获取的文件列表 |
+
+```cpp
+PwfClient client(appSecret);
+
+PwfResponse login = client.Login(licenseKey);
+if (!login.Success())
+    return ShowError(login.Message());
+client.StartHeartbeat();
+
+PwfResource core = client.GetResource("core.dat");
+if (!core.Success())
+    return ShowError(core.Message());          // NOT_FOUND, SESSION_EXPIRED, RATE_LIMITED
+
+// the loader passes the bytes to its DLL in memory: nothing is written to disk
+using StartFn = bool (*)(const unsigned char* data, std::size_t size);
+HMODULE dll = LoadLibraryW(L"MyCore.dll");
+auto start = reinterpret_cast<StartFn>(GetProcAddress(dll, "Start"));
+start(core.bytes.data(), core.bytes.size());
+```
+
+- 被拒绝时和 `Login` 一样，返回一个失败的响应。没有会话时调用会抛出异常，字节与 SHA-256 不符时抛出 `PwfSecurityError`
+- 每位客户的副本都带有自己的标记，流出的副本可以追溯到某个密钥。因此字节内容因客户而异，不要拿它和程序里固定的哈希值比较
+- 二进制文件的标记在最后一个字节之后，所以要让 DLL 忽略其数据之后的内容。文本文件的标记是不可见字符
+- 一个会话每小时最多获取 60 个文件，所以请在启动时获取一次，不要放在循环里。单个文件最大 10 MB
+
+把新的 `PwfClient.h` 和 `PwfClient.cpp` 复制到你的项目中；`ServerPublicKey.h` 和 `ProductionPolicy.h` 没有变化
+
 ## 网络被屏蔽：2026-10-13（1.4）
 
 部分网络会屏蔽 `pwfauth.com` 这个域名（阿联酋的 Etisalat 会返回“域名不存在”），导致应用在不使用 VPN 的情况下无法连接许可证服务器。现在，当 `pwfauth.com` 完全没有响应时，`PwfClient` 会改用同一服务器的第二个域名 `https://pwfauth.net`：

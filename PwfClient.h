@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 // The license server could not be reached at all: offline, DNS, firewall, proxy or TLS.
 class PwfNetworkError : public std::runtime_error
@@ -54,6 +56,28 @@ public:
     std::string Message() const;
 
     static PwfResponse Parse(const std::string& body);
+};
+
+// A protected file from GetResource. bytes is the file, after its SHA-256 was checked;
+// it stays empty after a refusal, so check Success() first. data keeps the reply's name,
+// size, sha256, is_text and is_module, without the base64 copy of the file
+class PwfResource : public PwfResponse
+{
+public:
+    PwfResource() = default;
+    explicit PwfResource(PwfResponse reply) : PwfResponse(std::move(reply)) {}
+
+    std::vector<unsigned char> bytes;
+};
+
+// The list from ListResources. names stays empty after a refusal
+class PwfResourceList : public PwfResponse
+{
+public:
+    PwfResourceList() = default;
+    explicit PwfResourceList(PwfResponse reply) : PwfResponse(std::move(reply)) {}
+
+    std::vector<std::string> names;
 };
 
 class PwfClient
@@ -111,6 +135,20 @@ public:
         const std::string& licenseKey);
     // The same for the account signed in with AccountLogin, through its session (no password).
     PwfResponse RedeemKey(const std::string& licenseKey);
+
+    // Protected files: files your program needs that are kept on the server (App settings
+    // → Files in the panel) and given only to a signed-in program, after Login or
+    // AccountLogin. Each customer's copy carries their own mark, so the bytes and the
+    // SHA-256 differ from one customer to the next. A file locked to an add-on goes only
+    // to customers who have it
+
+    // Fetches a file by its name in the panel. The SHA-256 the server sends is checked
+    // before the bytes are returned: a mismatch throws PwfSecurityError. Refusals:
+    // SESSION_EXPIRED, NOT_FOUND, RATE_LIMITED (60 an hour for a session, so fetch a file
+    // once at start, not in a loop)
+    PwfResource GetResource(const std::string& name);
+    // The names of the files this customer can fetch. Refusals: SESSION_EXPIRED
+    PwfResourceList ListResources();
 
     // Keeps the session alive AND obeys the kill switch. Only an encrypted reply counts
     // as an answer: maxHeartbeatFailures beats in a row without one (no reply, a plain

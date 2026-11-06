@@ -87,6 +87,51 @@ bin\Debug\PWFAuthCpp.exe
 The application runs an offline AES/HMAC round-trip self-test before showing the
 sign-in window. A real login still requires the application secret and a valid key
 
+## Protected files - 2026-11-07 (1.5)
+
+A protected file is a file your program needs that is kept on the PWF Auth server and given
+only to a signed-in program (add it in the panel: App settings → Files). A check inside a DLL
+can be patched out, but a part that stays on the server cannot: keep something the DLL cannot
+run without in a protected file, and a copy that skipped the sign-in has nothing to run.
+`PwfClient` now has:
+
+| Function | What it does |
+|---|---|
+| `GetResource(name)` | Fetches a file after `Login` or `AccountLogin`. `bytes` is the file, checked against the SHA-256 the server sent |
+| `ListResources()` | `names` is the list of files this customer can fetch |
+
+```cpp
+PwfClient client(appSecret);
+
+PwfResponse login = client.Login(licenseKey);
+if (!login.Success())
+    return ShowError(login.Message());
+client.StartHeartbeat();
+
+PwfResource core = client.GetResource("core.dat");
+if (!core.Success())
+    return ShowError(core.Message());          // NOT_FOUND, SESSION_EXPIRED, RATE_LIMITED
+
+// the loader passes the bytes to its DLL in memory: nothing is written to disk
+using StartFn = bool (*)(const unsigned char* data, std::size_t size);
+HMODULE dll = LoadLibraryW(L"MyCore.dll");
+auto start = reinterpret_cast<StartFn>(GetProcAddress(dll, "Start"));
+start(core.bytes.data(), core.bytes.size());
+```
+
+- A refusal comes back as a failed reply, like `Login`. A call without a session throws, and
+  bytes that do not match their SHA-256 throw `PwfSecurityError`
+- Each customer's copy carries their own mark, so a copy that turns up leads back to a key.
+  The bytes therefore differ from customer to customer: do not compare them with a fixed hash
+  in your program
+- In a binary file the mark comes after the last byte, so let your DLL ignore anything after
+  its data. In a text file it is invisible characters
+- A session can fetch 60 files an hour, so fetch a file once at start, not in a loop. A file
+  can be up to 10 MB
+
+Copy the new `PwfClient.h` and `PwfClient.cpp` into your project; `ServerPublicKey.h` and
+`ProductionPolicy.h` are unchanged
+
 ## Blocked networks - 2026-10-13 (1.4)
 
 Some networks block the name `pwfauth.com` (Etisalat in the UAE answers "no such domain"),

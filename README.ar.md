@@ -60,6 +60,41 @@ bin\Debug\PWFAuthCpp.exe
 
 يُجري التطبيق اختباراً ذاتياً دون اتصال لدورة AES/HMAC كاملة قبل عرض نافذة تسجيل الدخول. أما تسجيل الدخول الحقيقي فيتطلب سر التطبيق ومفتاحاً صالحاً
 
+## الملفات المحمية (1.5، بتاريخ 2026-11-07)
+
+الملف المحمي ملف يحتاجه برنامجك، يبقى على خادم PWF Auth ولا يصل إلا إلى برنامج سجّل الدخول (أضفه من لوحة التحكم: App settings → Files). يمكن تعطيل أي فحص داخل مكتبة DLL بتعديلها، لكن ذلك لا ينفع مع جزء يبقى على الخادم: ضع في ملف محمي شيئاً لا تعمل المكتبة من دونه، فلا تجد النسخة التي تخطّت تسجيل الدخول ما تشغّله. صار في `PwfClient` الآن:
+
+| الدالة | ما تفعله |
+|---|---|
+| `GetResource(name)` | تجلب ملفاً بعد `Login` أو `AccountLogin`. الحقل `bytes` هو الملف بعد التحقق منه بقيمة SHA-256 التي أرسلها الخادم |
+| `ListResources()` | الحقل `names` هو قائمة الملفات التي يستطيع هذا العميل جلبها |
+
+```cpp
+PwfClient client(appSecret);
+
+PwfResponse login = client.Login(licenseKey);
+if (!login.Success())
+    return ShowError(login.Message());
+client.StartHeartbeat();
+
+PwfResource core = client.GetResource("core.dat");
+if (!core.Success())
+    return ShowError(core.Message());          // NOT_FOUND, SESSION_EXPIRED, RATE_LIMITED
+
+// the loader passes the bytes to its DLL in memory: nothing is written to disk
+using StartFn = bool (*)(const unsigned char* data, std::size_t size);
+HMODULE dll = LoadLibraryW(L"MyCore.dll");
+auto start = reinterpret_cast<StartFn>(GetProcAddress(dll, "Start"));
+start(core.bytes.data(), core.bytes.size());
+```
+
+- يعود الرفض رداً فاشلاً كما في `Login`، ويرمي الاستدعاء دون جلسة استثناءً، أما البيانات التي لا تطابق قيمة SHA-256 فترمي `PwfSecurityError`
+- تحمل نسخة كل عميل علامته، فالنسخة التي تظهر في مكان ما تقود إلى مفتاحه. لذلك تختلف البيانات من عميل إلى آخر، فلا تقارنها بقيمة hash ثابتة في برنامجك
+- تُضاف العلامة بعد آخر بايت في الملف الثنائي، فاجعل المكتبة تتجاهل ما بعد بياناتها. وفي الملف النصي تكون العلامة أحرفاً غير مرئية
+- يمكن للجلسة جلب 60 ملفاً في الساعة، فاجلب الملف مرة واحدة عند البدء لا داخل حلقة. والحد الأقصى لحجم الملف 10 MB
+
+انسخ الملفين الجديدين `PwfClient.h` و`PwfClient.cpp` إلى مشروعك، أما `ServerPublicKey.h` و`ProductionPolicy.h` فلم يتغيرا
+
 ## الشبكات المحجوبة (1.4، بتاريخ 2026-10-13)
 
 بعض الشبكات تحجب الاسم `pwfauth.com` (شبكة Etisalat في الإمارات تجيب بأن النطاق غير موجود)، فلم يكن التطبيق يصل إلى خادم التراخيص دون VPN. صار `PwfClient` الآن يجرّب الخادم نفسه باسم ثانٍ، `https://pwfauth.net`، عندما لا يصل أي رد على الإطلاق من `pwfauth.com`:

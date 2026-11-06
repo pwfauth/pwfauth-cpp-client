@@ -60,6 +60,41 @@ bin\Debug\PWFAuthCpp.exe
 
 Uygulama, giriş penceresini göstermeden önce çevrimdışı bir AES/HMAC gidiş-dönüş öz testi çalıştırır. Gerçek bir giriş için yine de uygulama gizli anahtarı ve geçerli bir anahtar gerekir
 
+## Korumalı dosyalar: 2026-11-07 (1.5)
+
+Korumalı dosya, programınızın ihtiyaç duyduğu, PWF Auth sunucusunda tutulan ve yalnızca oturum açmış bir programa verilen dosyadır (panelden ekleyin: App settings → Files). Bir DLL içindeki kontrol yamalanarak kaldırılabilir, ama sunucuda kalan bir parça kaldırılamaz: DLL'nin onsuz çalışamayacağı bir şeyi korumalı dosyada tutun, böylece oturum açmayı atlayan bir kopyanın çalıştıracak hiçbir şeyi olmaz. `PwfClient` artık şunları içeriyor:
+
+| Fonksiyon | Ne yapar |
+|---|---|
+| `GetResource(name)` | `Login` veya `AccountLogin` sonrasında bir dosyayı getirir. `bytes` dosyanın kendisidir ve sunucunun gönderdiği SHA-256 ile doğrulanmıştır |
+| `ListResources()` | `names` bu müşterinin getirebileceği dosyaların listesidir |
+
+```cpp
+PwfClient client(appSecret);
+
+PwfResponse login = client.Login(licenseKey);
+if (!login.Success())
+    return ShowError(login.Message());
+client.StartHeartbeat();
+
+PwfResource core = client.GetResource("core.dat");
+if (!core.Success())
+    return ShowError(core.Message());          // NOT_FOUND, SESSION_EXPIRED, RATE_LIMITED
+
+// the loader passes the bytes to its DLL in memory: nothing is written to disk
+using StartFn = bool (*)(const unsigned char* data, std::size_t size);
+HMODULE dll = LoadLibraryW(L"MyCore.dll");
+auto start = reinterpret_cast<StartFn>(GetProcAddress(dll, "Start"));
+start(core.bytes.data(), core.bytes.size());
+```
+
+- Ret, `Login` gibi başarısız bir yanıt olarak döner. Oturum olmadan yapılan çağrı bir istisna fırlatır, SHA-256 ile uyuşmayan baytlar ise `PwfSecurityError` fırlatır
+- Her müşterinin kopyası kendi işaretini taşır, bu yüzden ortaya çıkan bir kopya bir anahtara götürür. Baytlar bu nedenle müşteriden müşteriye değişir: onları programınızdaki sabit bir hash ile karşılaştırmayın
+- İkili dosyada işaret son bayttan sonra gelir, bu yüzden DLL'niz verisinden sonrasını yok saymalıdır. Metin dosyasında işaret görünmez karakterlerdir
+- Bir oturum saatte 60 dosya getirebilir, bu yüzden dosyayı döngü içinde değil başlangıçta bir kez getirin. Bir dosya en fazla 10 MB olabilir
+
+Yeni `PwfClient.h` ve `PwfClient.cpp` dosyalarını projenize kopyalayın; `ServerPublicKey.h` ve `ProductionPolicy.h` değişmedi
+
 ## Engellenen ağlar: 2026-10-13 (1.4)
 
 Bazı ağlar `pwfauth.com` adını engelliyor (BAE'deki Etisalat "böyle bir alan adı yok" yanıtı veriyor), bu yüzden uygulama VPN olmadan lisans sunucusuna ulaşamıyordu. `PwfClient` artık `pwfauth.com` hiç yanıt vermediğinde aynı sunucuyu ikinci bir adla, `https://pwfauth.net` üzerinden dener:

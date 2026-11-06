@@ -69,6 +69,11 @@ namespace
     constexpr int TooManyRequests = 429;
     constexpr DWORD RetryDelayMilliseconds = 300;  // before the second try of a request with no reply
     constexpr std::size_t MaxResetReason = 255;  // characters, as the server counts them
+    constexpr wchar_t ResourcePath[] = L"/api/auth/resource.php";
+    constexpr std::size_t MaxReplyBytes = 4 * 1024 * 1024;
+    // A protected file is base64 inside the sealed reply, which is base64 again: the 10 MB
+    // the server keeps at most comes to about 18 MB here
+    constexpr std::size_t MaxResourceReplyBytes = 24 * 1024 * 1024;
 
     std::string JsonText(const nlohmann::json& object, const char* key)
     {
@@ -792,6 +797,60 @@ PwfResponse PwfClient::RedeemKey(const std::string& licenseKey)
     });
 }
 
+PwfResource PwfClient::GetResource(const std::string& name)
+{
+    // The server answers an empty name with the list, not with a file
+    const std::string file = TrimAscii(name);
+    if (file.empty())
+        throw std::invalid_argument("The file name is required");
+    const std::string session = SessionId();
+    if (session.empty())
+        throw std::runtime_error("Not signed in; call Login or AccountLogin before GetResource");
+
+    PwfResource resource(SendEnvelope(ResourcePath, {
+        {"session_id", session},
+        {"name", file}
+    }));
+    if (!resource.Success())
+        return resource;
+
+    // The server never serves an empty file: its mark is always in the bytes
+    const std::string encoded = JsonText(resource.data, "data");
+    if (encoded.empty())
+        throw PwfSecurityError("The reply did not contain the protected file");
+    ByteVector bytes = Base64Decode(encoded);
+    if (!ConstantTimeEquals(HexLower(Sha256(std::string(bytes.begin(), bytes.end()))),
+        JsonText(resource.data, "sha256")))
+        throw PwfSecurityError("The protected file does not match its SHA-256");
+
+    // The file stays in bytes only, not a second time as base64 in the reply
+    resource.bytes = std::move(bytes);
+    resource.data.erase("data");
+    resource.rawJson = resource.data.dump();
+    return resource;
+}
+
+PwfResourceList PwfClient::ListResources()
+{
+    const std::string session = SessionId();
+    if (session.empty())
+        throw std::runtime_error("Not signed in; call Login or AccountLogin before ListResources");
+
+    PwfResourceList list(SendEnvelope(ResourcePath, {
+        {"session_id", session}
+    }));
+    if (list.Success() && list.data.contains("files") && list.data["files"].is_array())
+    {
+        for (const nlohmann::json& file : list.data["files"])
+        {
+            const std::string name = JsonText(file, "name");
+            if (!name.empty())
+                list.names.push_back(name);
+        }
+    }
+    return list;
+}
+
 void PwfClient::StartHeartbeat()
 {
     StopHeartbeat();
@@ -989,7 +1048,7 @@ PwfClient::HttpReply PwfClient::HttpPostTo(const std::string& origin, const std:
         requestPath.append(parts.lpszExtraInfo, parts.dwExtraInfoLength);
 
     InternetHandle session(WinHttpOpen(
-        L"PwfAuthCpp/1.4 (+https://pwfauth.com)",
+        L"PwfAuthCpp/1.5 (+https://pwfauth.com)",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME,
         WINHTTP_NO_PROXY_BYPASS,
@@ -1055,6 +1114,7 @@ PwfClient::HttpReply PwfClient::HttpPostTo(const std::string& origin, const std:
         reply.status = static_cast<int>(status);
 
     // A 4xx still carries the API's JSON refusal worth reading.
+    const std::size_t maxReply = path == ResourcePath ? MaxResourceReplyBytes : MaxReplyBytes;
     while (true)
     {
         DWORD available = 0;
@@ -1062,7 +1122,7 @@ PwfClient::HttpReply PwfClient::HttpPostTo(const std::string& origin, const std:
             ThrowNetworkError("Reading the reply");
         if (available == 0)
             break;
-        if (available > 4 * 1024 * 1024 || reply.body.size() > 4 * 1024 * 1024 - available)
+        if (available > maxReply || reply.body.size() > maxReply - available)
             throw PwfSecurityError("Server response exceeds the size limit.");
         const std::size_t offset = reply.body.size();
         reply.body.resize(offset + available);
